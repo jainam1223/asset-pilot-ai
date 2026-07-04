@@ -1,0 +1,11 @@
+.venv
+__pycache__
+*.pyc
+.git
+.env
+.env.docker
+test/
+eval_queries.py
+nlsql.py
+*.dbml.layout.json
+uv.lock
