@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+.env.docker
+
+# Test suite — local-only, not part of the shipped repo (harness,
+# fixtures, generated output, and the QA report all stay untracked).
+test/
+
+# CLI/dev-only tooling — not used by the deployed FastAPI service.
+# ai_service/schema.py only reads "schema_llm_context 1.dbml" at
+# runtime; the full schema, its layout file, the CLI entrypoint, and
+# its eval fixtures are dev artifacts, not shipped app code.
+nlsql.py
+eval_queries.py
+schema_v3 3.dbml
+schema_v3 3.dbml.layout.json

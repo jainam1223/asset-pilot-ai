@@ -1,0 +1,166 @@
+// ITAM schema — trimmed for LLM context (NL→SQL generation).
+// Source of truth: schema_v3 3.dbml. Regenerate this file from that one on
+// any schema change (§3.1 of AI_DEP.md adds columns to item_category — not
+// yet reflected here; update when that migration lands).
+// Dropped vs. source: index definitions, default-value clauses beyond enum
+// defaults, migration/UI-behavior notes. Kept: every table/column/type,
+// every PK/FK/UNIQUE, every enum + its values, and one-line notes only
+// where a column's meaning isn't obvious from its name.
+
+Project itam {
+  database_type: 'PostgreSQL'
+  note: 'IT Asset Management. Employees request devices by category; IT assigns a specific unit. Supports WFH shipping, date extensions, peer-to-peer temporary handovers, and an append-only audit log (device_log). Requests are never deleted.'
+}
+
+// ---- ENUMS ----
+enum user_role { employee, manager, it_admin }
+enum device_status { available, assigned, shipping_pending, return_shipping_pending, under_repair, maintenance, lost, retired, returned_to_client }
+enum request_status { requested, pending_mgr_approval, pending_it_approval, assigned, completed, rejected, cancelled }
+enum mgr_approval_status { not_required, pending, approved, rejected }
+enum rejected_by_enum { manager, it_admin, it_admin_cancel }
+enum request_priority { low, medium, high }
+enum owner_type { company, client }
+enum support_type { update, damage, lost }
+enum support_status { open, in_progress, resolved }
+enum support_resolution { remote_resolved, repaired_in_place, swapped, marked_lost }
+enum extension_status { pending, approved, rejected }
+enum handover_status { requested, accepted, rejected, cancelled, completed }
+enum device_log_event { device_created, device_edited, assigned, client_assigned, ship_outbound_initiated, ship_outbound_completed, return_ship_initiated, return_received, assignment_completed, status_changed, support_opened, support_resolved, support_auto_closed, extension_requested, extension_approved, extension_rejected, handover_requested, handover_accepted, handover_rejected, handover_cancelled, handover_completed, marked_lost, retired, returned_to_client }
+enum actor_role { employee, manager, it_admin, system }
+
+// Every table below also has: created_at timestamptz, updated_at timestamptz
+
+// ---- TABLES ----
+
+Table user {
+  id         uuid    [pk]
+  name       varchar
+  email      varchar [unique]
+  role       user_role [default: employee]
+  manager_id uuid    [ref: > user.id, note: 'set only when role=employee']
+  is_active  boolean [default: true, note: 'false = left company']
+}
+
+Table item_category {
+  id                    uuid    [pk]
+  name                  varchar [unique]
+  description           text
+  requires_mgr_approval boolean [default: false, note: 'snapshotted onto request.requires_mgr_approval at creation']
+  is_active             boolean [default: true]
+}
+
+Table item {
+  id                uuid          [pk]
+  name              varchar
+  serial_no         varchar       [unique]
+  category_id       uuid          [ref: > item_category.id]
+  owner_type        owner_type    [default: company]
+  client_name       varchar       [note: 'set only when owner_type=client']
+  status            device_status [default: available]
+  current_owner_id  uuid          [ref: > user.id, note: 'current holder; null when not assigned to anyone']
+  purchase_date     date
+  qr_code_token     uuid          [unique]
+}
+
+Table request {
+  id                     uuid             [pk]
+  requester_id           uuid             [ref: > user.id]
+  category_id            uuid             [ref: > item_category.id]
+  assigned_item_id       uuid             [ref: > item.id]
+  requested_from         timestamptz      [note: 'employee-intended start, immutable']
+  requested_to           timestamptz      [note: 'employee-intended end, immutable']
+  assigned_from          timestamptz      [note: 'IT-confirmed start']
+  assigned_to            timestamptz      [note: 'IT-confirmed end; pushed out by an approved extension_request']
+  status                 request_status   [default: requested]
+  priority               request_priority [default: medium]
+  note                   text
+  requires_mgr_approval  boolean          [default: false]
+  mgr_approval_status    mgr_approval_status [default: not_required]
+  manager_id             uuid             [ref: > user.id, note: 'requester manager, snapshotted at creation']
+  manager_decision_note  text
+  manager_decided_at     timestamptz
+  it_decided_by          uuid             [ref: > user.id]
+  it_decision_note       text
+  it_decided_at          timestamptz
+  rejected_by            rejected_by_enum
+  rejected_reason        text
+  cancelled_by           uuid             [ref: > user.id]
+  cancelled_at           timestamptz
+  is_wfh                 boolean          [default: false, note: 'work-from-home shipping request']
+  ship_tracking_url      text
+  ship_initiated_at      timestamptz
+  ship_completed_at      timestamptz
+  return_tracking_url    text
+  return_initiated_at    timestamptz
+  completed_at           timestamptz
+  completed_by           uuid             [ref: > user.id]
+  completed_next_status  device_status    [note: 'status IT chose for the device when the request completed']
+  is_client_direct       boolean          [default: false, note: 'true = client device direct-assigned, no approval workflow']
+}
+
+Table extension_request {
+  id                     uuid                [pk]
+  original_request_id    uuid                [ref: > request.id]
+  requester_id           uuid                [ref: > user.id]
+  current_assigned_to    timestamptz         [note: 'snapshot of request.assigned_to when this was filed']
+  extended_to            timestamptz         [note: 'new end date requested']
+  status                 extension_status    [default: pending]
+  requires_mgr_approval  boolean             [default: false]
+  manager_id             uuid                [ref: > user.id]
+  mgr_approval_status    mgr_approval_status [default: not_required]
+  manager_note           text
+  manager_decided_at     timestamptz
+  it_decided_by          uuid                [ref: > user.id]
+  it_note                text
+  it_decided_at          timestamptz
+}
+
+Table handover_request {
+  id                        uuid            [pk]
+  item_id                   uuid            [ref: > item.id]
+  owner_id                  uuid            [ref: > user.id, note: 'device owner at time of request']
+  borrower_id               uuid            [ref: > user.id]
+  requested_duration_hours  integer         [note: 'informational only, never enforced']
+  status                    handover_status [default: requested]
+  requested_at              timestamptz
+  decided_at                timestamptz     [note: 'when owner accepted/rejected']
+  completed_at              timestamptz     [note: 'when borrower returned it to the owner']
+  note                      text
+}
+// Note: temporary peer-to-peer loan; never changes item.status or item.current_owner_id.
+
+Table support_request {
+  id                  uuid               [pk]
+  item_id             uuid               [ref: > item.id]
+  requester_id        uuid               [ref: > user.id]
+  request_id          uuid               [ref: > request.id, note: 'active assignment this ticket was filed under']
+  type                support_type
+  description         text
+  status              support_status     [default: open]
+  resolution          support_resolution
+  it_note             text
+  swapped_to_item_id  uuid               [ref: > item.id, note: 'set only when resolution=swapped']
+  filed_at            timestamptz
+  resolved_by         uuid               [ref: > user.id]
+  resolved_at         timestamptz
+  auto_closed         boolean            [default: false, note: 'true = closed automatically when the parent request completed, not by an IT action']
+}
+
+Table device_log {
+  id                     uuid              [pk]
+  item_id                uuid              [ref: > item.id]
+  event_type             device_log_event
+  actor_id               uuid              [ref: > user.id, note: 'null only for the system-triggered support_auto_closed event']
+  actor_role             actor_role
+  request_id             uuid              [ref: > request.id]
+  support_request_id     uuid              [ref: > support_request.id]
+  extension_request_id   uuid              [ref: > extension_request.id]
+  handover_request_id    uuid              [ref: > handover_request.id]
+  from_value             text
+  to_value               text
+  note                   text
+  metadata               jsonb
+  is_milestone           boolean           [note: 'true = shown by default in the device timeline UI']
+  occurred_at            timestamptz
+}
+// Note: append-only audit trail — one row per state change across item/request/support/extension/handover.
