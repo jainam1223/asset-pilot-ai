@@ -28,24 +28,33 @@ def render(result: SQLResponse) -> str:
     )
 
 
+def _humanize_key(key: str) -> str:
+    return key.replace("_", " ").strip().capitalize()
+
+
 def format_rows(rows: list[dict], sample_size: int = 5) -> str:
+    """Best-effort plain-language rendering used only when the
+    answer-synthesis LLM call itself fails (every provider down/cooling
+    off) — pipeline.ask()'s last resort before showing the user
+    something. Since there's no LLM available to phrase this well, it
+    won't read as naturally as a real synthesized answer, but it must
+    never show a raw SQL column/alias name or look like a database
+    table dump — that's the whole reason this exists instead of just
+    printing the rows.
+    """
     if not rows:
-        return "(0 rows)"
+        return "I didn't find anything matching that."
 
-    columns = list(rows[0].keys())
+    if len(rows) == 1 and len(rows[0]) == 1:
+        value = next(iter(rows[0].values()))
+        return f"The result is **{value}**."
+
     sample = rows[:sample_size]
-    widths = {c: max(len(c), *(len(str(r.get(c, ""))) for r in sample)) for c in columns}
-
-    header = " | ".join(c.ljust(widths[c]) for c in columns)
-    sep = "-+-".join("-" * widths[c] for c in columns)
-    body = "\n".join(
-        " | ".join(str(r.get(c, "")).ljust(widths[c]) for c in columns)
-        for r in sample
-    )
-
-    out = f"{header}\n{sep}\n{body}"
+    lines = [
+        "- " + ", ".join(f"{_humanize_key(k)}: {v}" for k, v in row.items() if v not in (None, ""))
+        for row in sample
+    ]
+    out = "\n".join(lines)
     if len(rows) > sample_size:
-        out += f"\n({len(rows)} rows total, {sample_size} shown)"
-    else:
-        out += f"\n({len(rows)} row{'s' if len(rows) != 1 else ''})"
+        out += f"\n...and {len(rows) - sample_size} more."
     return out

@@ -23,7 +23,7 @@ async def chat_employee(body: ChatRequest, request: Request):
         result = await ask(
             body.query,
             chain=request.app.state.chain,
-            schema_text=request.app.state.schema,
+            schema_text=request.app.state.schemas["employee"],
             role="employee",
         )
         return ChatResponse(answer=result.answer, refused=result.refused)
@@ -46,7 +46,7 @@ async def chat_admin(body: ChatRequest, request: Request):
         result = await ask(
             body.query,
             chain=request.app.state.chain,
-            schema_text=request.app.state.schema,
+            schema_text=request.app.state.schemas["it_admin"],
             role="it_admin",
         )
         return ChatResponse(answer=result.answer, refused=result.refused)
