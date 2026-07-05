@@ -25,6 +25,12 @@ resource "azurerm_linux_web_app" "app" {
     }
   }
 
+  lifecycle {
+    ignore_changes = [
+      site_config[0].application_stack[0].docker_image_name
+    ]
+  }
+
   app_settings = {
     # Provide the App Service with credentials to pull the image from ACR
     "DOCKER_REGISTRY_SERVER_URL"          = "https://${data.azurerm_container_registry.acr.login_server}"
