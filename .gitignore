@@ -25,3 +25,4 @@ nlsql.py
 eval_queries.py
 schema_v3 3.dbml
 schema_v3 3.dbml.layout.json
+.terraform/
