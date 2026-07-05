@@ -39,8 +39,14 @@ async def malformed_request_handler(request: Request, exc: RequestValidationErro
     # returns its raw parser detail (field paths, "Expecting ','
     # delimiter", etc.) straight to the client — an internal detail
     # leak, same class of problem as leaking a stack trace or SQL error.
+    #
+    # status_code=200, not 422: every other refusal in this API (scope,
+    # destructive, empty question, off-topic) is a normal 200 with
+    # refused=true — a non-2xx status here is the one thing that could
+    # still surface "422 Unprocessable Entity" as raw HTTP status text
+    # in some client, even though the JSON body itself was already clean.
     logger.warning(f"request_validation_failed: {exc}")
     return JSONResponse(
-        status_code=422,
+        status_code=200,
         content={"answer": MALFORMED_REQUEST_MESSAGE, "refused": True},
     )
