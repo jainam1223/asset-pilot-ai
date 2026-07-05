@@ -23,11 +23,10 @@ from dataclasses import dataclass
 from loguru import logger
 
 from ai_service.db import execute_select
-from ai_service.errors import user_facing_message
+from ai_service.errors import EMPTY_QUERY_MESSAGE, user_facing_message
 from ai_service.formatting import format_rows
 from ai_service.models import SQLResponse
 from ai_service.providers import Provider, generate_sql as generate_sql_via_chain
-from ai_service.schema import slice_schema_for_role
 from ai_service.sql_check import check_shape
 from ai_service.synthesis import synthesize_answer
 
@@ -81,11 +80,21 @@ async def ask(
     """Run the full pipeline for one question. Never raises — every
     failure mode (refusal, bad scope, execution error, LLM outage)
     becomes a refused=True result with a human-readable answer.
+
+    `schema_text` must already be sliced for `role` (see
+    ai_service.schema.build_role_schemas, called once at app startup) —
+    this function does not re-slice it, since the sliced output is the
+    same for every call with this role and shouldn't be recomputed
+    per request.
     """
-    sliced_schema = slice_schema_for_role(schema_text, role)
+    if not question.strip():
+        # Deterministic, no LLM call spent on a question that isn't one —
+        # every role gets the exact same fixed wording instead of the
+        # model free-writing its own (and inconsistent) refusal.
+        return _refused(EMPTY_QUERY_MESSAGE, sql=None, reason="empty question", sql_provider=None)
 
     try:
-        data, sql_provider = await generate_sql_via_chain(question, sliced_schema, role, chain=chain)
+        data, sql_provider = await generate_sql_via_chain(question, schema_text, role, chain=chain)
         result = SQLResponse.model_validate(data)
     except Exception as exc:
         logger.error(f"SQL generation failed: {exc}")

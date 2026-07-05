@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ai_service.roles import TABLE_SCOPE
+from ai_service.roles import TABLE_SCOPE, VALID_ROLES
 
 SCHEMA_FILENAME = "schema_llm_context 1.dbml"
 
@@ -74,3 +74,16 @@ def slice_schema_for_role(schema: str, role: str) -> str:
         i += 1
 
     return "\n".join(out).strip()
+
+
+def build_role_schemas(schema: str) -> dict[str, str]:
+    """Slice `schema` once per role up front.
+
+    There are only ever as many distinct outputs as there are roles
+    (today: it_admin's full slice, and the catalog-only slice shared by
+    employee/manager) and none of them change for the life of the
+    process — call this once at app startup and hand each request its
+    role's already-sliced schema, instead of re-running the same
+    brace-matching pass on every single request.
+    """
+    return {role: slice_schema_for_role(schema, role) for role in VALID_ROLES}

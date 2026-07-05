@@ -51,6 +51,17 @@ UNEXPECTED_MESSAGE = (
     "happening, it's worth flagging to your IT admin."
 )
 
+EMPTY_QUERY_MESSAGE = (
+    "I didn't get a question to work with — ask me something about "
+    "devices, categories, or (depending on your access) requests and "
+    "support tickets."
+)
+
+MALFORMED_REQUEST_MESSAGE = (
+    "I couldn't understand that request. Try asking your question in "
+    "plain language, like \"How many laptops are available?\""
+)
+
 # Exception type -> fixed human-facing message. Order matters: more
 # specific subclasses must come before their parent classes, since
 # lookup walks the MRO and returns the first match.
