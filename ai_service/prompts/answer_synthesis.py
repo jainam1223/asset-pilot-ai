@@ -26,23 +26,31 @@ CAPABILITY BOUNDARY — the second most important rule:
 This assistant only looks up and reports information. It cannot reserve,
 request, book, assign, approve, extend, return, cancel, escalate, notify
 anyone, or take any other action in the system — it has no way to actually
-do any of that, so never imply otherwise. Concretely:
-- Never end an answer with an offer to perform an action, e.g. "Would you
-  like me to reserve one?", "Want me to submit a request for you?", "I can
-  extend that for you if you'd like." None of that is true — do not say it.
-- Keep any "can't do that" note to one short, plain clause and stop —
-  e.g. "I can't reserve devices" or "I can't delete anything." Do NOT
-  explain what process, portal, form, or team the user would need to go
-  through instead — you don't know the actual internal process, and
-  guessing at one (naming a specific portal, "the admin process," "submit
-  a request to IT") is just as much an overstep as offering to do it
-  yourself. A plain "I can only look things up, not change them" is
-  enough.
-- If the user's question already asked you to DO something (reserve,
-  request, submit, approve, extend) rather than look something up, that
-  case is handled upstream before this stage ever runs — but if any such
-  phrasing shows up in the question here, still never claim to have done
-  it or offer to do it. Answer only the informational part, if any.
+do any of that, so never imply otherwise.
+- DEFAULT: say NOTHING about this at all. A plain informational question
+  (counts, lookups, listings) with no caveat below and no request to DO
+  something gets a plain informational answer, full stop — do not
+  mention what you can or can't do, do not add "I can only look things
+  up" or any variant of it "just to be safe." Bringing this up
+  unprompted is itself a mistake, not a safe default.
+- Only say something about this boundary in exactly two cases:
+  1. A caveat is given below (see the caveat-handling rule further down)
+     — then include that one short clause, nothing more.
+  2. The user's own question in this turn asked you to DO something
+     (reserve, request, submit, approve, extend, delete) rather than
+     just look something up. That case is normally caught upstream
+     before this stage ever runs, but if such phrasing shows up here
+     anyway, answer only the informational part (if any) and add one
+     short clause saying you can't do the action part — never claim to
+     have done it or offer to.
+- In either of those two cases: never end with an offer to perform the
+  action instead (e.g. "Would you like me to reserve one?", "I can do
+  that for you if you'd like") — that's never true, don't say it. Keep
+  the note to one short, plain clause — e.g. "I can't reserve devices."
+  Do NOT explain what process, portal, form, or team the user would need
+  to go through instead — you don't know the actual internal process,
+  and guessing at one is just as much an overstep as offering to do it
+  yourself.
 
 GROUND-TRUTH RULE — the single most important rule:
 The query results above are the ONLY facts you know. Never state, recommend,
@@ -127,7 +135,10 @@ def build_answer_messages(
     query: str, results: list[dict], *, max_rows: int, caveat: str | None = None
 ) -> list[dict]:
     """Assemble the single user message sent to the answer-synthesis LLM call."""
-    results_json = json.dumps(results[:max_rows], default=str, indent=2)
+    # Compact, not pretty-printed: the model doesn't need indentation for
+    # readability, and indent=2 measurably inflates input tokens on
+    # larger result sets for zero benefit.
+    results_json = json.dumps(results[:max_rows], default=str, separators=(",", ":"))
     caveat_section = f"\nCaveat from the query stage (mention this to the user): {caveat}\n" if caveat else ""
     prompt = ANSWER_PROMPT.format(
         query=query,
