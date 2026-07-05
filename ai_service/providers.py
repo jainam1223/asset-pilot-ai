@@ -34,6 +34,14 @@ from loguru import logger
 
 from ai_service.prompts import build_messages
 
+
+class NoProviderConfiguredError(RuntimeError):
+    """Raised when no provider in the chain has credentials in .env."""
+
+
+class AllProvidersFailedError(RuntimeError):
+    """Raised when every configured provider failed or is cooling down."""
+
 # Errors worth a same-provider retry: one-off blips (timeout, connection
 # reset, a transient 5xx) where a second attempt might succeed.
 RETRYABLE_ERROR_SUBSTRINGS = (
@@ -250,13 +258,16 @@ async def _try_provider(provider: Provider, messages: list[dict], *, json_mode: 
 async def run_chain(messages: list[dict], *, chain: list[Provider], json_mode: bool) -> tuple[str, str]:
     """Try each available, non-cooling-down provider in order.
 
-    Returns (raw_text, provider_name_used). Raises RuntimeError if every
-    provider fails or all are cooling down.
+    Returns (raw_text, provider_name_used). Raises NoProviderConfiguredError
+    if .env has no credentials at all, or AllProvidersFailedError if every
+    configured provider failed or is cooling down — distinct types so the
+    caller (ai_service.errors) can map each to its own message instead of
+    a single generic "something broke."
     """
     available = [p for p in chain if p.available]
 
     if not available:
-        raise RuntimeError(
+        raise NoProviderConfiguredError(
             "No LLM provider is configured. Set AZURE_OPENAI_API_KEY + "
             "AZURE_OPENAI_ENDPOINT, or one of GROQ_API_KEY, "
             "CEREBRAS_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY in .env."
@@ -281,13 +292,13 @@ async def run_chain(messages: list[dict], *, chain: list[Provider], json_mode: b
         return raw, provider.name
 
     if not attempted_any:
-        raise RuntimeError(
+        raise AllProvidersFailedError(
             "All configured providers are cooling down from rate limits. "
             "Wait a moment and try again, or add another provider's API key."
         )
 
     assert last_exc is not None
-    raise RuntimeError(f"All {len(available)} providers failed. Last error: {last_exc}")
+    raise AllProvidersFailedError(f"All {len(available)} providers failed. Last error: {last_exc}")
 
 
 async def generate_sql(question: str, schema_text: str, role: str, *, chain: list[Provider]) -> tuple[dict, str]:
