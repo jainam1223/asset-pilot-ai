@@ -4,6 +4,7 @@ pydantic
 python-dotenv
 loguru
 psycopg[binary]
+psycopg_pool
 groq
 cerebras
 openai

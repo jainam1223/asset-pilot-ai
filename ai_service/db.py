@@ -1,11 +1,18 @@
 """
-db.py — Postgres connection, role lookup, and read-only SELECT execution.
+db.py — Postgres connection pool, role lookup, and read-only SELECT execution.
 
-Fully async (psycopg.AsyncConnection) so this drops straight into a
-FastAPI route without blocking the event loop. The AI service does not
-own the schema (the backend team does) and never writes to it — every
-connection opened here is set read-only at the transaction level as a
-second wall behind the SQL-shape checks in sql_check.py.
+Fully async (psycopg.AsyncConnection via psycopg_pool.AsyncConnectionPool)
+so this drops straight into a FastAPI route without blocking the event
+loop. The AI service does not own the schema (the backend team does)
+and never writes to it — every connection handed out here is read-only
+by session default as a second wall behind the SQL-shape checks in
+sql_check.py.
+
+A process-wide pool replaces the old per-request connect/close: opening
+a fresh connection to an Azure-hosted Postgres (TLS handshake + auth,
+on top of TCP) on every single request was pure overhead the pool
+eliminates by keeping a handful of already-authenticated connections
+warm and reusing them.
 """
 
 from __future__ import annotations
@@ -19,44 +26,44 @@ from typing import Any, AsyncIterator
 import psycopg
 from dotenv import load_dotenv
 from loguru import logger
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 load_dotenv()
 
 # Without these, a slow/unreachable Postgres endpoint hangs the calling
 # request indefinitely (observed: a 2-minute stall during testing with
-# no timeout configured). CONNECT_TIMEOUT bounds the initial TCP/auth
-# handshake; STATEMENT_TIMEOUT_MS bounds how long any single query can
-# run once connected — both matter equally for a FastAPI route that
-# must not tie up a worker forever on a DB hiccup. Kept short: if the
-# DB is actually down, every second here is a second every concurrent
-# request is stuck waiting — the circuit breaker below is what protects
-# against a sustained outage, not a longer timeout on each attempt.
+# no timeout configured). CONNECT_TIMEOUT bounds how long a checkout
+# waits for a connection to become available; STATEMENT_TIMEOUT_MS
+# bounds how long any single query can run once connected.
 CONNECT_TIMEOUT_SECONDS = 5
 STATEMENT_TIMEOUT_MS = 15_000
 
-# Circuit breaker: once a connection attempt fails, stop trying fresh
-# connections for this long and fail fast with the transient message
-# instead. Without this, a real Postgres outage means every single
-# concurrent request independently pays the full CONNECT_TIMEOUT_SECONDS
-# — this mirrors the cooldown pattern in ai_service/providers.py, just
-# for the one DB target instead of a chain of LLM providers.
+# Small on purpose: this is a low-concurrency hackathon demo, not a
+# service under real load. min_size keeps at least one connection warm
+# so the common case skips the handshake entirely; max_size just caps
+# how many the pool will ever open concurrently.
+POOL_MIN_SIZE = 1
+POOL_MAX_SIZE = 5
+
+# Circuit breaker: once a checkout fails, stop trying fresh checkouts
+# for this long and fail fast with the transient message instead.
+# Without this, a real Postgres outage means every single concurrent
+# request independently waits out the full pool checkout timeout — this
+# mirrors the cooldown pattern in ai_service/providers.py, just for the
+# one DB target instead of a chain of LLM providers.
 DB_COOLDOWN_SECONDS = 30.0
 
 # Module-level, not per-request: this state is shared across every
-# caller in the process, which is the point — one failed connection
-# attempt should stop the *next* caller from immediately re-trying too.
+# caller in the process, which is the point — one failed checkout
+# should stop the *next* caller from immediately re-trying too.
 _cooldown_until = 0.0
 
-# Guards the actual connection attempt below (not the whole request —
-# each caller still gets and uses its own connection object once one
-# succeeds). Without this, N truly-concurrent requests arriving before
-# the cooldown is set would each independently start a slow attempt and
-# each pay the full CONNECT_TIMEOUT_SECONDS before any of them has had
-# a chance to set the cooldown for the others. With the lock, only the
-# first caller actually dials out; everyone else queued behind the lock
-# re-checks cooldown state immediately after — since the first caller
-# just set it — and fails fast instead of dialing out themselves.
-_connect_lock = asyncio.Lock()
+_pool: AsyncConnectionPool | None = None
+
+# Guards pool creation only (a one-time event per process) — not every
+# checkout. Without this, N concurrent first-callers would each try to
+# construct their own AsyncConnectionPool.
+_pool_lock = asyncio.Lock()
 
 
 def _db_cooling_down() -> bool:
@@ -99,65 +106,105 @@ def _raise_cooling_down() -> None:
     )
 
 
-async def _connect() -> psycopg.AsyncConnection:
-    """Make (or skip) exactly one real connection attempt, serialized
-    across concurrent callers via _connect_lock.
+async def _configure_connection(conn: psycopg.AsyncConnection) -> None:
+    """Run once per physical connection, when the pool creates it — not
+    on every checkout. Read-only and the statement timeout become
+    session-level defaults for the lifetime of this physical
+    connection, so a normal request just checks out a connection and
+    queries it, with no per-request setup statements."""
+    await conn.set_autocommit(True)
+    await conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+    await conn.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
 
-    Concurrent requests that arrive while one attempt is already in
-    flight queue on the lock rather than each starting their own dial-out.
-    By the time a queued caller acquires the lock, either the first
-    caller succeeded (cooldown still clear — this caller dials out too,
-    now against a confirmed-live DB) or failed (cooldown now set — this
-    caller fails fast without touching the network at all).
+
+async def _get_pool() -> AsyncConnectionPool:
+    """Lazily create the single process-wide pool on first use.
+
+    Normally this only runs once, at app startup, via warm_pool() below
+    — see its docstring for why. This lazy path just makes get_connection()
+    self-sufficient (e.g. under a bare pytest that never calls warm_pool()),
+    without changing steady-state behavior.
     """
-    if _db_cooling_down():
-        _raise_cooling_down()
+    global _pool
+    if _pool is not None:
+        return _pool
+    async with _pool_lock:
+        if _pool is None:
+            url = os.getenv("POSTGRES_URL")
+            if not url:
+                raise RuntimeError("POSTGRES_URL is not set in .env")
+            pool = AsyncConnectionPool(
+                url,
+                min_size=POOL_MIN_SIZE,
+                max_size=POOL_MAX_SIZE,
+                timeout=CONNECT_TIMEOUT_SECONDS,
+                configure=_configure_connection,
+                open=False,
+            )
+            # wait=False: don't block whoever triggered pool creation on a
+            # DB that might be down — the pool fills connections in the
+            # background, and a checkout below still bounds its own wait.
+            await pool.open(wait=False)
+            _pool = pool
+    return _pool
 
-    url = os.getenv("POSTGRES_URL")
-    if not url:
-        raise RuntimeError("POSTGRES_URL is not set in .env")
 
-    async with _connect_lock:
-        # Re-check: another caller may have just set the cooldown while
-        # we were waiting for the lock.
-        if _db_cooling_down():
-            _raise_cooling_down()
+async def warm_pool() -> None:
+    """Pre-create POOL_MIN_SIZE connections at app startup instead of
+    lazily on the first real request.
 
-        try:
-            conn = await psycopg.AsyncConnection.connect(url, connect_timeout=CONNECT_TIMEOUT_SECONDS)
-        except (psycopg.OperationalError, TimeoutError) as exc:
-            logger.error(f"Could not connect to Postgres within {CONNECT_TIMEOUT_SECONDS}s: {exc}")
-            _start_db_cooldown()
-            raise DatabaseConnectionError(str(exc)) from exc
+    Without this, the pool exists (via _get_pool()) but is empty until
+    something checks it out — so the very first user request after a
+    cold start still pays the full connect+TLS+auth cost, the exact
+    overhead the pool was added to remove. Calling this from the
+    FastAPI lifespan moves that one-time cost to boot instead of onto
+    whoever's request happens to arrive first.
 
-        _clear_db_cooldown()  # a successful connection means the DB is back
-        return conn
+    Bounded by CONNECT_TIMEOUT_SECONDS and never raises — if the DB is
+    down at startup, this just logs and leaves the pool empty; normal
+    per-request checkout (and its circuit breaker) still applies as
+    before, so a DB outage at boot doesn't stop the app from starting.
+    """
+    pool = await _get_pool()
+    try:
+        await pool.wait(timeout=CONNECT_TIMEOUT_SECONDS)
+        logger.info(f"DB pool warmed: {POOL_MIN_SIZE} connection(s) ready")
+    except PoolTimeout as exc:
+        logger.warning(f"DB pool did not warm up within {CONNECT_TIMEOUT_SECONDS}s (DB may be down): {exc}")
+
+
+async def close_pool() -> None:
+    """Close the pool and every connection it holds. Call once at app
+    shutdown so nothing is left dangling when the process exits."""
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
 
 
 @asynccontextmanager
 async def get_connection() -> AsyncIterator[psycopg.AsyncConnection]:
-    """Open a read-only async connection to POSTGRES_URL.
+    """Check out a pooled, read-only connection.
 
-    Read-only is enforced at the transaction level so any SELECT that
-    somehow smuggled a write (a CTE with a DML clause, for example)
-    fails at the database instead of silently succeeding. Both the
-    connection attempt and every statement on it are time-bounded so a
-    slow/unreachable DB can never hang the caller indefinitely.
-
-    If a recent connection attempt failed, this fails immediately
-    (no network round-trip at all) until DB_COOLDOWN_SECONDS has
-    passed — see the circuit breaker constants above. Concurrent
-    callers during an outage coalesce onto one real attempt instead of
-    each independently paying the connect timeout — see _connect().
+    If a recent checkout failed, this fails immediately (no pool wait
+    at all) until DB_COOLDOWN_SECONDS has passed — see the circuit
+    breaker constants above. Otherwise, waits up to
+    CONNECT_TIMEOUT_SECONDS for the pool to hand back a connection
+    (instant if one is already idle in the pool, which is the common
+    case once it has warmed up).
     """
-    conn = await _connect()
+    if _db_cooling_down():
+        _raise_cooling_down()
 
+    pool = await _get_pool()
     try:
-        await conn.execute("SET TRANSACTION READ ONLY")
-        await conn.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
-        yield conn
-    finally:
-        await conn.close()
+        async with pool.connection(timeout=CONNECT_TIMEOUT_SECONDS) as conn:
+            _clear_db_cooldown()  # a successful checkout means the DB is up
+            yield conn
+    except (PoolTimeout, psycopg.OperationalError, TimeoutError) as exc:
+        logger.error(f"Could not get a Postgres connection within {CONNECT_TIMEOUT_SECONDS}s: {exc}")
+        _start_db_cooldown()
+        raise DatabaseConnectionError(str(exc)) from exc
 
 
 async def lookup_user_role(
